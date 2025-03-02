@@ -1,0 +1,188 @@
+---
+title: "Mapping Deforestation of the Study Area"
+author: "Zühal YILDIRIM"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+Sys.setlocale("LC_ALL", "en_US.UTF-8")
+```
+
+### Load Required Packages
+```{r}
+pacman::p_load(
+  terra,
+  sf,
+  maptiles,
+  tidyverse,
+  tidyterra,
+  leaflet,
+  basemaps,
+  ggeasy
+)
+```
+
+## Define Study Area (25 km Buffer)
+Projection to UTM Zone 18S because to define a 25 km buffer,metric system needed rather than WGS84, which is in degrees.Since forest loss data in EPSG:4326, buffer projected back.
+```{r}
+centroid <- read_sf("Study_Area/study_point.shp")
+leaflet(data = centroid) %>%
+  addTiles() %>%
+  addMarkers(~st_coordinates(centroid)[, 1], ~st_coordinates(centroid)[, 2], popup = "Study Point")
+
+centroid_metric <- st_transform(centroid, crs = 32718)
+buff <- st_buffer(centroid_metric, dist = 25000)
+study_area <- st_transform(buff, crs = 4326)
+
+leaflet() %>% 
+  addTiles() %>% 
+  addMeasure(primaryLengthUnit = "meters") %>% 
+  addMarkers(data = centroid, ~st_coordinates(centroid)[, 1], ~st_coordinates(centroid)[, 2], popup = "Study Point") %>% 
+  addPolygons(data = study_area, color = "blue", fillOpacity = 0.2)
+```
+
+## Load Forest Data
+### Explanation of the Data 
+Forest loss during the period 2000-2022, defined as a stand-replacement disturbance, or a change from a forest to non-forest state. Encoded as either 0 (no loss)  or else a value in the range 1-20, representing loss detected primarily in the year 2001-2022, respectively.
+
+```{r}
+forest_data <- rast("https://storage.googleapis.com/earthenginepartners-hansen/GFC-2022-v1.10/Hansen_GFC-2022-v1.10_lossyear_00N_080W.tif")
+plot(forest_data)
+```
+
+## Clip Forest Data to Study Area
+With the help of terra packet dasaset clipped as circular study area. 
+```{r}
+forest_region <- terra::crop(forest_data, terra::vect(study_area))
+circular_study_area <- terra::mask(forest_region, terra::vect(study_area))
+plot(circular_study_area)
+```
+
+## Deforestation Analysis
+
+The classify() function is used to convert the data into binary format. This way, the cells from specific years are assigned the value 1, while the other cells are assigned 0. After this, the size of each cell is calculated, and the total area is calculated by summing the areas of cells with a value of 1.
+```{r}
+breaks <- c(0, 7, 22)
+forest_loss_08_22 <- classify(circular_study_area, rcl = breaks)
+forest_loss_08_22 <- as.factor(forest_loss_08_22)
+plot(forest_loss_08_22, col = c("white", "red"))
+
+deforested_cells <- cellSize(circular_study_area, unit = "km")
+total_deforested_area_08_22 <- sum(deforested_cells[forest_loss_08_22 == 1], na.rm = TRUE)
+
+breaks2 <- c(0, 20, 22)
+forest_loss_21_22 <- classify(circular_study_area, rcl = breaks2)
+forest_loss_21_22 <- as.factor(forest_loss_21_22)
+plot(forest_loss_21_22, col = c("white", "red"))
+
+total_deforested_area_21_22 <- sum(deforested_cells[forest_loss_21_22 == 1], na.rm = TRUE)
+total_deforested_area_21 <- sum(deforested_cells[circular_study_area == 22], na.rm = TRUE)
+
+print(paste("Total deforested area between 2008-2022:", formatC(total_deforested_area_08_22, format = "f", digits = 3), "km²"))
+print(paste("Total deforested area between 2021-2022:", formatC(total_deforested_area_21_22, format = "f", digits = 3), "km²"))
+print(paste("Total deforested area 2021:", formatC(total_deforested_area_21, format = "f", digits = 3), "km²"))
+```
+
+## Deforestation Over Time (2008-2022)
+```{r echo=TRUE, fig.height=6, fig.width=15, warning=FALSE}
+deforestation_area_by_year <- data.frame(Year = integer(), Area = numeric())
+
+for (year in 8:22) {
+  deforested_cells <- cellSize(circular_study_area, unit = "km")
+  total_area <- sum(deforested_cells[circular_study_area == year], na.rm = TRUE)
+  deforestation_area_by_year <- rbind(deforestation_area_by_year, data.frame(Year = year + 2000, Area = total_area))
+}
+
+deforestation_area_by_year$Area <- formatC(deforestation_area_by_year$Area, format = "f", digits = 2)
+deforestation_area_by_year$Area <- as.numeric(deforestation_area_by_year$Area)
+
+ggplot(deforestation_area_by_year, aes(x = Year, y = Area)) +
+  geom_line(color = "blue", size = 1) +        
+  geom_point(color = "red", size = 3) +          
+  geom_text(aes(label = Area), vjust = -0.7, color = "black", size = 3) +  
+  labs(title = "Deforestation Area Over Time (2008-2022)", 
+       x = "Year", 
+       y = "Deforested Area (km²)") +
+  scale_x_continuous(breaks = seq(2008, 2022, by = 1)) +
+  theme_minimal() + 
+  theme(plot.title = element_text(size = 16, face = "bold"))
+
+```
+
+## Deforestation Map (2008-2022)
+
+The deforestation data, initially in a different coordinate reference system (CRS), is transformed into the EPSG:3857 CRS because the ESRI World Imagery service, used as the base map (bm), is in EPSG:3857.
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+deforestation <- circular_study_area
+deforestation[circular_study_area <= 7] <- NA
+
+buff <- st_buffer(centroid_metric, dist = 28000)
+map_layout <- st_transform(buff, crs = 3857)
+bbox <- st_bbox(map_layout)
+bbox_sf <- st_as_sfc(bbox)
+ext <- bbox_sf
+rm(bm)
+
+bm <- basemap_raster(ext, map_service = "esri", map_type = "world_imagery")
+bm <- as(bm, "SpatRaster")
+
+df_deforestation <- as.data.frame(deforestation, xy = TRUE)
+df_deforestation_sf <- st_as_sf(df_deforestation, coords = c("x", "y"), crs = 4326)
+df_deforestation_sf_transformed <- st_transform(df_deforestation_sf, crs = 3857)
+df_deforestation_coords <- st_coordinates(df_deforestation_sf_transformed)
+df_projected_deforestation <- cbind(as.data.frame(df_deforestation_sf_transformed), df_deforestation_coords)
+
+
+year_colors <- rainbow(15)
+
+year_labels <- sapply(deforestation_area_by_year$Year, function(year) {
+  area_value <- deforestation_area_by_year$Area[deforestation_area_by_year$Year == year]
+  paste(year, "   ", area_value, "km²")
+})
+
+ggplot() +
+  tidyterra::geom_spatraster_rgb(data = bm) +
+  geom_tile(data = df_projected_deforestation, 
+            aes(x = X, y = Y, fill = as.factor(Layer_1)), 
+            alpha = 0.6) +
+  scale_fill_manual(values = year_colors, 
+                    name = "Year",
+                    labels = year_labels) +
+  theme_minimal() +
+  ggtitle("Deforestation Map between 2008 - 2022") +
+  ggeasy::easy_center_title() +
+  theme(plot.title = element_text(size=20, face="bold"),
+        plot.background = element_rect(fill = "white", color = "white"))
+
+```
+
+```{r echo=TRUE, warning=FALSE}
+center_coords <- st_coordinates(centroid)
+
+pal <- colorFactor(palette = year_colors, 
+                   domain = as.factor(values(deforestation)), 
+                   na.color = "transparent")  
+leaflet() %>% 
+  setView(lng = center_coords[1], lat = center_coords[2], zoom = 12) %>%
+  addProviderTiles(providers$Esri.WorldImagery) %>% 
+  addRasterImage(deforestation, colors = pal, opacity = 1) %>% 
+  addLegend(
+    position = "bottomright",
+    pal = pal,  
+    values = values(deforestation),
+    title = "Deforestation by Year",
+    labFormat = labelFormat(
+      suffix = paste("   ", deforestation_area_by_year$Area, "km²"),
+      big.mark = "",
+      transform = function(x) x + 2000
+    ),
+    opacity = 1
+  )
+```
+
+### Acknowledgments
+
+The methodology and techniques discussed in this work were inspired by the video "How R is Helping Us Fight Forest Loss and Climate Change" by **Milos Makes Maps**. You can watch the full video [here](https://www.youtube.com/watch?v=wruLRZZpQsk&t=1851s).
